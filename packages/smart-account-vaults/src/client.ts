@@ -93,8 +93,6 @@ import {
   TOKEN_PROGRAM_ID,
 } from "@solana/spl-token";
 import {
-  ComputeBudgetInstruction,
-  ComputeBudgetProgram,
   PublicKey,
   SYSVAR_INSTRUCTIONS_PUBKEY,
   SystemProgram,
@@ -308,8 +306,6 @@ type AsyncPolicyTransactionPayloadLike = {
 const EARN_DEPOSIT_VAULT_INDEX = 1 as const;
 const EARN_SAME_MINT_INSTRUCTION_CONSTRAINT_INDEXES = [0, 1] as const;
 const EARN_POLICY_PACKET_DATA_SIZE = 1232;
-const MAX_COMPUTE_UNIT_LIMIT = 1_400_000;
-const SYNC_EXECUTE_COMPUTE_UNIT_HEADROOM = 60_000;
 const EARN_DEPOSIT_USDC_DECIMALS = 6;
 const EARN_AUTODEPOSIT_TOKEN_APPROVAL_ALLOWANCE_RAW =
   (BigInt(1) << BigInt(64)) - BigInt(1);
@@ -5848,150 +5844,6 @@ export function createSmartAccountVaultsClient(
       payer: args.feePayer,
       programId: smartAccountsClient.programId,
       operations: [preparedTransaction, preparedProposal],
-    });
-  }
-
-  // Threshold-1, timeLock-0 accounts whose signer holds initiate+vote+execute
-  // can run the vault transfer in one executeTransactionSyncV2 instead of
-  // propose/approve/execute. The program rejects anything else on chain.
-  async function prepareVaultTransferSync(args: {
-    operation: string;
-    settingsPda: PublicKey;
-    signer: PublicKey;
-    feePayer: PublicKey;
-    accountIndex?: number;
-    memo?: string;
-    buildMessage: (
-      vaultPda: PublicKey
-    ) => Promise<{ instructions: TransactionInstruction[] }>;
-  }) {
-    const accountIndex = resolveVaultAccountIndex(args.accountIndex);
-    const vaultPda = pda.getSmartAccountPda({
-      programId: smartAccountsClient.programId,
-      settingsPda: args.settingsPda,
-      accountIndex,
-    })[0];
-    const message = await args.buildMessage(vaultPda);
-    const compiled = instructionsToSynchronousTransactionDetailsV2({
-      vaultPda,
-      members: [args.signer],
-      transaction_instructions: message.instructions,
-    });
-    const execution =
-      await smartAccountsClient.features.execution.prepare.executeTransactionSyncV2(
-        {
-          feePayer: args.feePayer,
-          settingsPda: args.settingsPda,
-          accountIndex,
-          numSigners: 1,
-          instructions: compiled.instructions,
-          instruction_accounts: compiled.accounts,
-          memo: args.memo,
-        } as never
-      );
-    return mergePreparedOperations({
-      operation: args.operation,
-      payer: args.feePayer,
-      programId: smartAccountsClient.programId,
-      operations: [execution],
-    });
-  }
-
-  // Sync vault execute for arbitrary vault instructions (e.g. a Jupiter swap)
-  // at threshold 1. ComputeBudget instructions move to the outer transaction,
-  // and the unit limit gets headroom for the smart-account CPI (measured
-  // +23k-34k CU on live Jupiter routes). The caller's lookup tables stay on the
-  // outer v0 message. Returns null when the result does not fit one packet, so
-  // the caller can fall back to propose/approve/execute.
-  async function prepareCustomInstructionSync(
-    args: Omit<SmartAccountCustomInstructionProposalInput, "creator"> & {
-      signer: PublicKey;
-    }
-  ) {
-    const isComputeBudget = (instruction: TransactionInstruction) =>
-      instruction.programId.equals(ComputeBudgetProgram.programId);
-    const vaultInstructions = args.instructions.filter(
-      (instruction) => !isComputeBudget(instruction)
-    );
-    if (vaultInstructions.length === 0) {
-      throw new Error(
-        "Custom instruction sync execute requires at least one instruction."
-      );
-    }
-    const computeBudgetInstructions = args.instructions
-      .filter(isComputeBudget)
-      .map((instruction) => {
-        if (
-          ComputeBudgetInstruction.decodeInstructionType(instruction) !==
-          "SetComputeUnitLimit"
-        ) {
-          return instruction;
-        }
-        const { units } =
-          ComputeBudgetInstruction.decodeSetComputeUnitLimit(instruction);
-        return ComputeBudgetProgram.setComputeUnitLimit({
-          units: Math.min(
-            MAX_COMPUTE_UNIT_LIMIT,
-            units + SYNC_EXECUTE_COMPUTE_UNIT_HEADROOM
-          ),
-        });
-      });
-    const execution = await prepareVaultTransferSync({
-      ...args,
-      operation: "executeCustomInstructionsSync",
-      buildMessage: async () => ({ instructions: vaultInstructions }),
-    });
-    const prepared = freezePreparedOperation({
-      ...execution,
-      instructions: [...computeBudgetInstructions, ...execution.instructions],
-      lookupTableAccounts: dedupeLookupTableAccounts(
-        args.addressLookupTableAccounts ?? []
-      ),
-    });
-    const length = preparedPacketLength(prepared);
-    return length !== null && length <= EARN_POLICY_PACKET_DATA_SIZE
-      ? prepared
-      : null;
-  }
-
-  function prepareSolTransferSync(
-    args: Omit<SmartAccountTransferProposalInput, "creator"> & {
-      signer: PublicKey;
-    }
-  ) {
-    return prepareVaultTransferSync({
-      ...args,
-      operation: "executeSolTransferSync",
-      buildMessage: (vaultPda) =>
-        createVaultSolTransferMessage({
-          connection: config.connection,
-          vaultPda,
-          destination: args.destination,
-          amountLamports: args.amountLamports,
-        }),
-    });
-  }
-
-  function prepareSplTransferSync(
-    args: Omit<SmartAccountTokenTransferProposalInput, "creator"> & {
-      signer: PublicKey;
-    }
-  ) {
-    return prepareVaultTransferSync({
-      ...args,
-      operation: "executeSplTransferSync",
-      buildMessage: (vaultPda) =>
-        createVaultSplTransferMessage({
-          connection: config.connection,
-          vaultPda,
-          mint: args.mint,
-          destinationOwner: args.destinationOwner,
-          amount: args.amount,
-          decimals: args.decimals,
-          destinationTokenAccount: args.destinationTokenAccount,
-          tokenProgramId: args.tokenProgramId,
-          createDestinationAta: args.createDestinationAta,
-        }),
     });
   }
 
@@ -12476,9 +12328,6 @@ export function createSmartAccountVaultsClient(
     fetchOverview,
     prepareSolTransferProposal,
     prepareSplTransferProposal,
-    prepareCustomInstructionSync,
-    prepareSolTransferSync,
-    prepareSplTransferSync,
     prepareCustomInstructionProposal,
     preparePolicyCustomInstructionProposal,
     prepareAddInitiateSigner,
