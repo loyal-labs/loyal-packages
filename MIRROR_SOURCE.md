@@ -3,7 +3,7 @@
 This repository is generated from `loyal-labs/loyal-yield-routing`.
 
 - Source path: `web/packages`
-- Source commit: `28017886510103f7c466942f3c2eb5b60d78af3c`
-- Generated at: `2026-11-03T03:59:09.156Z`
+- Source commit: `638e647f7dde415d33e0718222d1a163aabd28be`
+- Generated at: `2026-11-03T04:07:05.662Z`
 
 Do not edit this repository directly. Changes should land in `loyal-yield-routing/web`.
